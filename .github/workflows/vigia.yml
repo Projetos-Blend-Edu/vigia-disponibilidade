@@ -1,0 +1,111 @@
+name: Vigia de disponibilidade (reserva)
+
+# Reserva do vigia principal (agendador do Supabase, a cada 5 min). Roda de hora em
+# hora no GitHub para o caso de o próprio Supabase estar fora.
+# Este repositório é público (assim o GitHub não cobra os minutos), por isso:
+# - a lista de endereços fica no segredo SITES ("Nome|URL", uma por linha);
+# - a chave do Brevo fica no segredo BREVO_API_KEY, e os e-mails de envio e destino
+#   em AVISO_DE e AVISO_PARA;
+# - os registros públicos das execuções mostram só o NOME de cada site.
+# Segredos ficam cifrados, nunca aparecem no código nem nos registros e não são
+# entregues a cópias (forks) nem a pedidos de alteração de terceiros.
+# Avisa o time só quando a situação MUDA (caiu ou voltou).
+
+on:
+  schedule:
+    - cron: "7 * * * *"      # de hora em hora
+    - cron: "23 4 1 * *"     # dia 1 de cada mês: manutenção (ver abaixo)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  conferir:
+    if: github.event.schedule != '23 4 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Conferir os sites
+        id: sites
+        env:
+          SITES: ${{ secrets.SITES }}
+        run: |
+          if [ -z "$SITES" ]; then echo "::error::Segredo SITES não cadastrado."; exit 1; fi
+          fora=""
+          relatorio=""
+          while IFS='|' read -r nome url; do
+            [ -z "$url" ] && continue
+            echo "::add-mask::$url"
+            code=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 20 --retry 2 --retry-delay 10 "$url" || true)
+            [ -z "$code" ] && code=000
+            if [ "$code" = "000" ] || [ "$code" -ge 500 ]; then
+              situacao="FORA DO AR"; fora="$fora$nome, "
+              echo "::error::Fora do ar: $nome (HTTP $code)"
+            else
+              situacao="no ar"
+            fi
+            echo "$nome: $situacao (HTTP $code)"
+            relatorio="$relatorio<li><strong>$nome</strong> ($url): $situacao (HTTP $code)</li>"
+          done <<< "$SITES"
+          echo "fora=${fora%, }" >> "$GITHUB_OUTPUT"
+          # O relatório (com endereços) vai só para o e-mail do time, por arquivo, não para o registro.
+          printf '%s' "$relatorio" > relatorio.html
+
+      - name: Situação da execução anterior
+        id: antes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ant=$(gh api "repos/${{ github.repository }}/actions/workflows/vigia.yml/runs?status=completed&per_page=5" \
+            --jq '[.workflow_runs[] | select(.id != ${{ github.run_id }}) | select(.conclusion == "success" or .conclusion == "failure")][0].conclusion' || true)
+          echo "Execução anterior: ${ant:-nenhuma}"
+          echo "anterior=${ant:-success}" >> "$GITHUB_OUTPUT"
+
+      - name: Avisar o time (só na mudança)
+        env:
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          AVISO_PARA: ${{ secrets.AVISO_PARA }}
+          AVISO_DE: ${{ secrets.AVISO_DE }}
+          FORA: ${{ steps.sites.outputs.fora }}
+          ANTERIOR: ${{ steps.antes.outputs.anterior }}
+        run: |
+          if [ -n "$FORA" ] && [ "$ANTERIOR" = "success" ]; then
+            assunto="[ALERTA] [SITE] Fora do ar: $FORA (vigia de reserva)"
+          elif [ -z "$FORA" ] && [ "$ANTERIOR" = "failure" ]; then
+            assunto="[ALERTA] [SITE] De volta ao ar (vigia de reserva)"
+          else
+            echo "Sem mudança de situação: nenhum e-mail."; exit 0
+          fi
+          if [ -z "$BREVO_API_KEY" ]; then
+            echo "::warning::BREVO_API_KEY não cadastrada: o time não foi avisado por e-mail."; exit 0
+          fi
+          quando=$(TZ=America/Sao_Paulo date +"%d/%m/%Y %H:%M")
+          relatorio=$(cat relatorio.html)
+          html="<p>Este é um e-mail automático gerado pelo Supabase / GitHub com o objetivo de monitoramento do site da Blend Edu e das aplicações web conectadas ao domínio (ex.: o Portal do Cliente). Confira abaixo o status:</p><ul>$relatorio</ul><p>Conferido pelo vigia de reserva (GitHub) em $quando.</p><p style='margin-top:20px;color:#555;'>Essa informação foi compartilhada com toda a equipe Blend para garantir alinhamento. Compartilhe essa informação com a liderança (Thalita) para que as medidas necessárias sejam tomadas e eventuais fornecedores sejam contatados.</p>"
+          jq -n --arg s "$assunto" --arg h "$html" --arg de "$AVISO_DE" --arg para "$AVISO_PARA" '{sender:{name:"Vigia Blend Edu",email:$de},to:[{email:$para,name:"Equipe Blend Edu"}],subject:$s,htmlContent:$h}' > corpo.json
+          status=$(curl -s -o /dev/null -w "%{http_code}" -X POST https://api.brevo.com/v3/smtp/email \
+            -H "api-key: $BREVO_API_KEY" -H "Content-Type: application/json" --data @corpo.json)
+          echo "Brevo respondeu HTTP $status"
+
+      - name: Marcar falha se algum site estiver fora
+        if: steps.sites.outputs.fora != ''
+        run: exit 1
+
+  manter-ativo:
+    # O GitHub desliga agendamentos de repositório público após 60 dias sem
+    # atividade. Uma vez por mês, registra a data aqui para manter o vigia ligado.
+    if: github.event.schedule == '23 4 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Registrar atividade mensal
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > ultima-manutencao.txt
+          git config user.name "vigia-disponibilidade"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ultima-manutencao.txt
+          git commit -m "Manutenção mensal do agendamento" || exit 0
+          git push
